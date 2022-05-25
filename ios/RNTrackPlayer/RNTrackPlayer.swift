@@ -8,62 +8,44 @@
 
 import Foundation
 import MediaPlayer
-import SwiftAudioEx
+import WidgetKit
+import React
 
 @objc(RNTrackPlayer)
-public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
-
+public class RNTrackPlayer: RCTEventEmitter {
+    
     // MARK: - Attributes
-
+    
     private var hasInitialized = false
-    private let player = QueuedAudioPlayer()
-    private let audioSessionController = AudioSessionController.shared
-    private var shouldEmitUpdateEventInterval: Bool = false
-
+    
     // MARK: - Lifecycle Methods
-
-    public override init() {
-        super.init()
-
-        audioSessionController.delegate = self
-        player.event.playbackEnd.addListener(self, handleAudioPlayerPlaybackEnded)
-        player.event.receiveMetadata.addListener(self, handleAudioPlayerMetadataReceived)
-        player.event.stateChange.addListener(self, handleAudioPlayerStateChange)
-        player.event.fail.addListener(self, handleAudioPlayerFailed)
-        player.event.queueIndex.addListener(self, handleAudioPlayerQueueIndexChange)
-        player.event.secondElapse.addListener(self, handleAudioPlayerSecondElapse)
-    }
-
+    
     deinit {
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
+    
+    private var currentTrack: Track? = nil
+    
+    private var previousArtworkUrl : String? = nil
+    
+    private var placeHolderImageArtwork : MPMediaItemArtwork? = nil
+    
+    private var artworkUrl : MediaURL? = nil
 
+    
     // MARK: - RCTEventEmitter
-
+    
     override public static func requiresMainQueueSetup() -> Bool {
         return true;
     }
-
+    
     @objc(constantsToExport)
     override public func constantsToExport() -> [AnyHashable: Any] {
         return [
-            "STATE_NONE": State.none.rawValue,
-            "STATE_READY": State.ready.rawValue,
-            "STATE_PLAYING": State.playing.rawValue,
-            "STATE_PAUSED": State.paused.rawValue,
-            "STATE_STOPPED": State.stopped.rawValue,
-            "STATE_BUFFERING": State.buffering.rawValue,
-            "STATE_CONNECTING": State.connecting.rawValue,
-
-            "TRACK_PLAYBACK_ENDED_REASON_END": PlaybackEndedReason.playedUntilEnd.rawValue,
-            "TRACK_PLAYBACK_ENDED_REASON_JUMPED": PlaybackEndedReason.jumpedToIndex.rawValue,
-            "TRACK_PLAYBACK_ENDED_REASON_NEXT": PlaybackEndedReason.skippedToNext.rawValue,
-            "TRACK_PLAYBACK_ENDED_REASON_PREVIOUS": PlaybackEndedReason.skippedToPrevious.rawValue,
-            "TRACK_PLAYBACK_ENDED_REASON_STOPPED": PlaybackEndedReason.playerStopped.rawValue,
-
-            "PITCH_ALGORITHM_LINEAR": PitchAlgorithm.linear.rawValue,
-            "PITCH_ALGORITHM_MUSIC": PitchAlgorithm.music.rawValue,
-            "PITCH_ALGORITHM_VOICE": PitchAlgorithm.voice.rawValue,
+            "STATE_NONE": PlayState.none.rawValue,
+            "STATE_PLAYING": PlayState.playing.rawValue,
+            "STATE_PAUSED": PlayState.paused.rawValue,
+            "STATE_STOPPED": PlayState.stopped.rawValue,
 
             "CAPABILITY_PLAY": Capability.play.rawValue,
             "CAPABILITY_PLAY_FROM_ID": "NOOP",
@@ -80,13 +62,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             "CAPABILITY_LIKE": Capability.like.rawValue,
             "CAPABILITY_DISLIKE": Capability.dislike.rawValue,
             "CAPABILITY_BOOKMARK": Capability.bookmark.rawValue,
-
-            "REPEAT_OFF": RepeatMode.off.rawValue,
-            "REPEAT_TRACK": RepeatMode.track.rawValue,
-            "REPEAT_QUEUE": RepeatMode.queue.rawValue,
         ]
     }
-
+    
     @objc(supportedEvents)
     override public func supportedEvents() -> [String] {
         return [
@@ -94,9 +72,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             "playback-state",
             "playback-error",
             "playback-track-changed",
-            "playback-metadata-received",
-            "playback-progress-updated",
-
+            
+            "remote-play-pause",
             "remote-stop",
             "remote-pause",
             "remote-play",
@@ -111,744 +88,397 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             "remote-bookmark",
         ]
     }
-
-    // MARK: - AudioSessionControllerDelegate
-
-    public func handleInterruption(type: InterruptionType) {
-        switch type {
-        case .began:
-            // Interruption began, take appropriate actions (save state, update user interface)
-            self.sendEvent(withName: "remote-duck", body: [
-                "paused": true
-            ])
-        case let .ended(shouldResume):
-            if shouldResume {
-                // Interruption Ended - playback should resume
-                self.sendEvent(withName: "remote-duck", body: [
-                    "paused": false
-                ])
-            } else {
-                // Interruption Ended - playback should NOT resume
-                self.sendEvent(withName: "remote-duck", body: [
-                    "paused": true,
-                    "permanent": true
-                ])
+    
+    func setupInterruptionHandling() {
+        let notificationCenter = NotificationCenter.default
+        notificationCenter.removeObserver(self)
+        notificationCenter.addObserver(self,
+                                       selector: #selector(handleInterruption),
+                                       name: AVAudioSession.interruptionNotification,
+                                       object: nil)
+    }
+    
+    @objc func handleInterruption(notification: Notification) {
+        guard let userInfo = notification.userInfo,
+            let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+                return
+        }
+        
+        let center = MPNowPlayingInfoCenter.default()
+        
+        if(center.nowPlayingInfo == nil){
+            center.nowPlayingInfo = [
+                MPMediaItemPropertyTitle: "",
+                MPMediaItemPropertyArtist: "",
+                MPMediaItemPropertyAlbumTitle: "",
+                MPMediaItemPropertyPlaybackDuration: 0,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: 0,
+                MPNowPlayingInfoPropertyPlaybackRate: 0
+            ]
+        }
+        
+        if type == .began {
+            
+            var wasSupended = userInfo[AVAudioSessionInterruptionWasSuspendedKey] as? Bool
+            if #available(iOS 14.5, *) {
+                let reason = userInfo[AVAudioSessionInterruptionReasonKey] as? NSNumber
+                
+                if(reason != nil && reason == 1){
+                    wasSupended = true
+                }
+            
             }
-        }
-    }
-
-    // MARK: - Bridged Methods
-
-    @objc(setupPlayer:resolver:rejecter:)
-    public func setupPlayer(config: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if hasInitialized {
-            reject("player_already_initialized", "The player has already been initialized via setupPlayer.", nil)
-            return
-        }
-
-        // configure if player waits to play
-        let autoWait: Bool = config["waitForBuffer"] as? Bool ?? false
-        player.automaticallyWaitsToMinimizeStalling = autoWait
-
-        // configure buffer size
-        let minBuffer: TimeInterval = config["minBuffer"] as? TimeInterval ?? 0
-        player.bufferDuration = minBuffer
-
-        // configure if control center metdata should auto update
-        let autoUpdateMetadata: Bool = config["autoUpdateMetadata"] as? Bool ?? true
-        player.automaticallyUpdateNowPlayingInfo = autoUpdateMetadata
-
-        // configure audio session - category, options & mode
-        var sessionCategory: AVAudioSession.Category = .playback
-        var sessionCategoryMode: AVAudioSession.Mode = .default
-        var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
-        var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
-
-        if
-            let sessionCategoryStr = config["iosCategory"] as? String,
-            let mappedCategory = SessionCategory(rawValue: sessionCategoryStr) {
-            sessionCategory = mappedCategory.mapConfigToAVAudioSessionCategory()
-        }
-
-        if
-            let sessionCategoryModeStr = config["iosCategoryMode"] as? String,
-            let mappedCategoryMode = SessionCategoryMode(rawValue: sessionCategoryModeStr) {
-            sessionCategoryMode = mappedCategoryMode.mapConfigToAVAudioSessionCategoryMode()
-        }
-
-        if
-            let sessionCategoryPolicyStr = config["iosCategoryPolicy"] as? String,
-            let mappedCategoryPolicy = SessionCategoryPolicy(rawValue: sessionCategoryPolicyStr) {
-            sessionCategoryPolicy = mappedCategoryPolicy.mapConfigToAVAudioSessionCategoryPolicy()
-        }
-
-        let sessionCategoryOptsStr = config["iosCategoryOptions"] as? [String]
-        let mappedCategoryOpts = sessionCategoryOptsStr?.compactMap { SessionCategoryOptions(rawValue: $0)?.mapConfigToAVAudioSessionCategoryOptions() } ?? []
-        sessionCategoryOptions = AVAudioSession.CategoryOptions(mappedCategoryOpts)
-
-        if #available(iOS 13.0, *) {
-            try? AVAudioSession.sharedInstance().setCategory(sessionCategory, mode: sessionCategoryMode, policy: sessionCategoryPolicy, options: sessionCategoryOptions)
-        } else if #available(iOS 11.0, *) {
-            try? AVAudioSession.sharedInstance().setCategory(sessionCategory, mode: sessionCategoryMode, policy: sessionCategoryPolicy, options: sessionCategoryOptions)
-        } else {
-            try? AVAudioSession.sharedInstance().setCategory(sessionCategory, mode: sessionCategoryMode, options: sessionCategoryOptions)
-        }
-
-        // setup event listeners
-        player.remoteCommandController.handleChangePlaybackPositionCommand = { [weak self] event in
-            if let event = event as? MPChangePlaybackPositionCommandEvent {
-                self?.sendEvent(withName: "remote-seek", body: ["position": event.positionTime])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleNextTrackCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-next", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePauseCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-pause", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePlayCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-play", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePreviousTrackCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-previous", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleSkipBackwardCommand = { [weak self] event in
-            if let command = event.command as? MPSkipIntervalCommand,
-               let interval = command.preferredIntervals.first {
-                self?.sendEvent(withName: "remote-jump-backward", body: ["interval": interval])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleSkipForwardCommand = { [weak self] event in
-            if let command = event.command as? MPSkipIntervalCommand,
-               let interval = command.preferredIntervals.first {
-                self?.sendEvent(withName: "remote-jump-forward", body: ["interval": interval])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleStopCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-stop", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleTogglePlayPauseCommand = { [weak self] _ in
-            if self?.player.playerState == .paused {
-                self?.sendEvent(withName: "remote-play", body: nil)
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            self?.sendEvent(withName: "remote-pause", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleLikeCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-like", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleDislikeCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-dislike", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleBookmarkCommand = { [weak self] _ in
-            self?.sendEvent(withName: "remote-bookmark", body: nil)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        hasInitialized = true
-        resolve(NSNull())
-    }
-
-    @objc(isServiceRunning:rejecter:)
-    public func isServiceRunning(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        // TODO That is probably always true
-        resolve(player != nil)
-    }
-
-    @objc(destroy:rejecter:)
-    public func destroy(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        print("Destroying player")
-        self.player.stop()
-        self.player.nowPlayingInfoController.clear()
-        try? AVAudioSession.sharedInstance().setActive(false)
-        hasInitialized = false
-    }
-
-    @objc(updateOptions:resolver:rejecter:)
-    public func update(options: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        var capabilitiesStr = options["capabilities"] as? [String] ?? []
-        if (capabilitiesStr.contains("play") && capabilitiesStr.contains("pause")) {
-            capabilitiesStr.append("togglePlayPause");
-        }
-        let capabilities = capabilitiesStr.compactMap { Capability(rawValue: $0) }
-
-        player.remoteCommands = capabilities.map { capability in
-            capability.mapToPlayerCommand(forwardJumpInterval: options["forwardJumpInterval"] as? NSNumber,
-                                          backwardJumpInterval: options["backwardJumpInterval"] as? NSNumber,
-                                          likeOptions: options["likeOptions"] as? [String: Any],
-                                          dislikeOptions: options["dislikeOptions"] as? [String: Any],
-                                          bookmarkOptions: options["bookmarkOptions"] as? [String: Any])
-        }
-
-        if let interval = options["progressUpdateEventInterval"] as? NSNumber, interval.intValue > 0 {
-            shouldEmitUpdateEventInterval = true
-            configureProgressUpdateEvent(interval: interval.doubleValue)
-        } else {
-            shouldEmitUpdateEventInterval = false
-        }
-
-        resolve(NSNull())
-    }
-
-    private func configureProgressUpdateEvent(interval: Double) {
-        let time = CMTime(seconds: interval, preferredTimescale: 1)
-        self.player.timeEventFrequency = .custom(time: time)
-    }
-
-    @objc(add:before:resolver:rejecter:)
-    public func add(trackDicts: [[String: Any]], before trackIndex: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            UIApplication.shared.beginReceivingRemoteControlEvents();
-        }
-
-        var tracks = [Track]()
-        for trackDict in trackDicts {
-            guard let track = Track(dictionary: trackDict) else {
-                reject("invalid_track_object", "Track is missing a required key", nil)
+            
+            if(wasSupended != nil && wasSupended == true){
                 return
             }
 
-            tracks.append(track)
+            center.nowPlayingInfo![MPNowPlayingInfoPropertyPlaybackRate] = 0
+            // Interruption began, take appropriate actions
+            self.sendEvent(withName: "remote-duck", body: [
+                "paused": true
+                ])
         }
-
-        var index: Int = 0
-        if (trackIndex.intValue < -1 || trackIndex.intValue > player.items.count) {
-            reject("index_out_of_bounds", "The track index is out of bounds", nil)
-        } else if trackIndex.intValue == -1 { // -1 means no index was passed and therefore should be inserted at the end.
-            index = player.items.count
-            try? player.add(items: tracks, playWhenReady: false)
-        } else {
-            index = trackIndex.intValue
-            try? player.add(items: tracks, at: trackIndex.intValue)
-        }
-
-        resolve(index)
-    }
-
-    @objc(remove:resolver:rejecter:)
-    public func remove(tracks indexes: [Int], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        for index in indexes {
-            // we do not allow removal of the current item
-            if index == player.currentIndex { continue }
-            try? player.removeItem(at: index)
-        }
-
-        resolve(NSNull())
-    }
-
-    @objc(removeUpcomingTracks:rejecter:)
-    public func removeUpcomingTracks(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.removeUpcomingItems()
-        resolve(NSNull())
-    }
-
-    @objc(skip:initialTime:resolver:rejecter:)
-    public func skip(
-        to trackIndex: NSNumber,
-        initialTime: Double,
-        resolve: RCTPromiseResolveBlock,
-        reject: RCTPromiseRejectBlock
-    ) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        if (trackIndex.intValue < 0 || trackIndex.intValue >= player.items.count) {
-            reject("index_out_of_bounds", "The track index is out of bounds", nil)
-            return
-        }
-
-        print("Skipping to track:", trackIndex)
-        try? player.jumpToItem(atIndex: trackIndex.intValue, playWhenReady: player.playerState == .playing)
-
-        // if an initialTime is passed the seek to it
-        if (initialTime >= 0) {
-            self.seek(to: initialTime, resolve: resolve, reject: reject)
-        } else {
-            resolve(NSNull())
-        }
-    }
-
-    @objc(skipToNext:resolver:rejecter:)
-    public func skipToNext(
-        initialTime: Double,
-        resolve: RCTPromiseResolveBlock,
-        reject: RCTPromiseRejectBlock
-    ) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        do {
-            try player.next()
-
-            // if an initialTime is passed the seek to it
-            if (initialTime >= 0) {
-                self.seek(to: initialTime, resolve: resolve, reject: reject)
-            } else {
-                resolve(NSNull())
+        else if type == .ended {
+            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                if options.contains(.shouldResume) {
+                    // Interruption Ended - playback should resume
+                    center.nowPlayingInfo![MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+                    self.sendEvent(withName: "remote-duck", body: [
+                        "paused": false
+                        ])
+                } else {
+                    // Interruption Ended - playback should NOT resume
+                    self.sendEvent(withName: "remote-duck", body: [
+                        "paused": true,
+                        "permanent": true
+                        ])
+                }
             }
-        } catch (_) {
-            reject("queue_exhausted", "There is no tracks left to play", nil)
         }
     }
 
-    @objc(skipToPrevious:resolver:rejecter:)
-    public func skipToPrevious(
-        initialTime: Double,
-        resolve: RCTPromiseResolveBlock,
-        reject: RCTPromiseRejectBlock
-    ) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
+    private func setupPlayer() {
+        if hasInitialized {
             return
         }
+        
+        setupInterruptionHandling();
+        
+        let center = MPRemoteCommandCenter.shared()
 
-        do {
-            try player.previous()
-
-            // if an initialTime is passed the seek to it
-            if (initialTime >= 0) {
-                self.seek(to: initialTime, resolve: resolve, reject: reject)
-            } else {
-                resolve(NSNull())
+            if #available(iOS 9.1, *) {
+                center.changePlaybackPositionCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                        if let event = commandEvent as? MPChangePlaybackPositionCommandEvent {
+                        self.sendEvent(withName: "remote-seek", body: ["position": event.positionTime])
+                        return MPRemoteCommandHandlerStatus.success
+                    }
+                    
+                    return MPRemoteCommandHandlerStatus.commandFailed
+                }
             }
-        } catch (_) {
-            reject("no_previous_track", "There is no previous track", nil)
-        }
+            
+            center.playCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-play", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            
+            center.pauseCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-pause", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.nextTrackCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-next", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.previousTrackCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-previous", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.skipBackwardCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                    if let command = commandEvent.command as? MPSkipIntervalCommand,
+                        let interval = command.preferredIntervals.first {
+                        self.sendEvent(withName: "remote-jump-backward", body: ["interval": interval])
+                        return MPRemoteCommandHandlerStatus.success
+                    }
+              
+                return MPRemoteCommandHandlerStatus.commandFailed
+            }
+            
+            center.skipForwardCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                   if let command = commandEvent.command as? MPSkipIntervalCommand,
+                        let interval = command.preferredIntervals.first {
+                        self.sendEvent(withName: "remote-jump-forward", body: ["interval": interval])
+                        return MPRemoteCommandHandlerStatus.success
+                    }
+                    
+                    return MPRemoteCommandHandlerStatus.commandFailed
+            }
+        
+            center.stopCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-stop", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.togglePlayPauseCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                    self.sendEvent(withName: "remote-play-pause", body: nil)
+                           return MPRemoteCommandHandlerStatus.success
+            }
+            
+            
+            center.likeCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-like", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.dislikeCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-dislike", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+            
+            center.bookmarkCommand.addTarget { (commandEvent) -> MPRemoteCommandHandlerStatus in
+                self.sendEvent(withName: "remote-bookmark", body: nil)
+                return MPRemoteCommandHandlerStatus.success
+            }
+                
+        hasInitialized = true
     }
-
+    
     @objc(reset:rejecter:)
     public func reset(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.stop()
-        player.nowPlayingInfoController.clear()
+        print("Resetting player.")
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         resolve(NSNull())
         DispatchQueue.main.async {
             UIApplication.shared.endReceivingRemoteControlEvents();
         }
     }
-
-    @objc(play:rejecter:)
-    public func play(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
+    
+    @objc(updateOptions:resolver:rejecter:)
+    public func update(options: [String: Any], resolve: @escaping RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+        DispatchQueue.main.async {
+            let capabilitiesStr = options["capabilities"] as? [String]
+            let capabilities = capabilitiesStr?.compactMap { Capability(rawValue: $0) } ?? []
+            
+            let jumpInterval = options["jumpInterval"] as? NSNumber
+            let likeOptions = options["likeOptions"] as? [String: Any]
+            let dislikeOptions = options["dislikeOptions"] as? [String: Any]
+            let bookmarkOptions = options["bookmarkOptions"] as? [String: Any]
+            
+            let center = MPRemoteCommandCenter.shared()
+            
+            
+            if #available(iOS 9.1, *) {
+                center.changePlaybackPositionCommand.isEnabled = capabilities.contains(.seek)
+            }
+            
+            center.togglePlayPauseCommand.isEnabled = capabilities.contains(.play)
+            
+            center.playCommand.isEnabled = capabilities.contains(.play)
+            center.pauseCommand.isEnabled = capabilities.contains(.pause)
+            center.nextTrackCommand.isEnabled = capabilities.contains(.next)
+            center.previousTrackCommand.isEnabled = capabilities.contains(.previous)
+            
+            center.skipBackwardCommand.isEnabled = capabilities.contains(.jumpBackward)
+            center.skipBackwardCommand.preferredIntervals = [jumpInterval ?? 15]
+            
+            center.skipForwardCommand.isEnabled = capabilities.contains(.jumpForward)
+            center.skipForwardCommand.preferredIntervals = [jumpInterval ?? 15]
+            
+            center.stopCommand.isEnabled = capabilities.contains(.stop)
+            
+            center.likeCommand.isEnabled = likeOptions?["isActive"] as? Bool ?? false//capabilities.contains(.like)
+            center.likeCommand.localizedTitle = likeOptions?["title"] as? String ?? "Like"
+            center.likeCommand.localizedShortTitle = likeOptions?["title"] as? String ?? "Like"
+            
+            center.dislikeCommand.isEnabled = dislikeOptions?["isActive"] as? Bool ?? false//capabilities.contains(.like)
+            center.dislikeCommand.localizedTitle = dislikeOptions?["title"] as? String ?? "Dislike"
+            center.dislikeCommand.localizedShortTitle = dislikeOptions?["title"] as? String ?? "Dislike"
+            
+            center.bookmarkCommand.isEnabled = bookmarkOptions?["isActive"] as? Bool ?? false//capabilities.contains(.like)
+            center.bookmarkCommand.localizedTitle = bookmarkOptions?["title"] as? String ?? "Bookmark"
+            center.bookmarkCommand.localizedShortTitle = bookmarkOptions?["title"] as? String ?? "Bookmark"
+            
+            
+            //load placeholder
+            if(self.placeHolderImageArtwork == nil && options["placeholderImage"] != nil){
+                let placeHolderImage : UIImage = RCTConvert.uiImage(options["placeholderImage"])
+                
+                if #available(iOS 10.0, *) {
+                    self.placeHolderImageArtwork = MPMediaItemArtwork.init(boundsSize: placeHolderImage.size, requestHandler: { (size) -> UIImage in
+                        return placeHolderImage
+                    })
+                } else {
+                    self.placeHolderImageArtwork = MPMediaItemArtwork(image: placeHolderImage)
+                }
+            }
+            
+           resolve(NSNull())
         }
 
-        try? AVAudioSession.sharedInstance().setActive(true)
-        player.play()
-        resolve(NSNull())
     }
-
-    @objc(pause:rejecter:)
-    public func pause(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
+    
+    @objc(setNowPlaying:resolver:rejecter:)
+    public func setNowPlaying(trackDict: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+        
+        if(!hasInitialized){
+            setupPlayer()
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            UIApplication.shared.beginReceivingRemoteControlEvents();
         }
 
-        player.pause()
-        resolve(NSNull())
+        currentTrack = Track(dictionary: trackDict)
+        updatePlayback(properties: trackDict, resolve: resolve, reject: reject)
+        
     }
+    
+    @objc(updatePlayback:resolver:rejecter:)
+    public func updatePlayback(properties: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
 
-    // NOTE: this method is really just an alias for pause. It should NOT call `player.stop` as
-    // that will reset the player, which is not the API intent.
-    @objc(stop:rejecter:)
-    public func stop(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        self.pause(resolve: resolve, reject: reject)
-    }
+        let center = MPNowPlayingInfoCenter.default()
 
-    @objc(seekTo:resolver:rejecter:)
-    public func seek(to time: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
+        let stateRaw = properties["state"] as? String
+
+        let state = stateRaw != nil ? PlayState(rawValue: stateRaw!) : PlayState.none
+
+        currentTrack?.updateMetadata(dictionary: properties)
+
+        updateMetadata(properties: properties, state: state)
+
+        let commandCenter = MPRemoteCommandCenter.shared()
+
+        if(state == PlayState.stopped){
+                commandCenter.stopCommand.isEnabled = false
         }
 
-        player.seek(to: time)
-        resolve(NSNull())
-    }
-
-    @objc(setRepeatMode:resolver:rejecter:)
-    public func setRepeatMode(repeatMode: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: repeatMode.intValue) ?? .off
-        resolve(NSNull())
-    }
-
-    @objc(getRepeatMode:rejecter:)
-    public func getRepeatMode(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.repeatMode.rawValue)
-    }
-
-    @objc(setVolume:resolver:rejecter:)
-    public func setVolume(level: Float, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.volume = level
-        resolve(NSNull())
-    }
-
-    @objc(getVolume:rejecter:)
-    public func getVolume(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.volume)
-    }
-
-    @objc(setRate:resolver:rejecter:)
-    public func setRate(rate: Float, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.rate = rate
-        resolve(NSNull())
-    }
-
-    @objc(getRate:rejecter:)
-    public func getRate(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.rate)
-    }
-
-    @objc(getTrack:resolver:rejecter:)
-    public func getTrack(index: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        if (index.intValue >= 0 && index.intValue < player.items.count) {
-            let track = player.items[index.intValue]
-            resolve((track as? Track)?.toObject())
-        } else {
-            resolve(NSNull())
-        }
-    }
-
-    @objc(getQueue:rejecter:)
-    public func getQueue(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        let serializedQueue = player.items.map { ($0 as! Track).toObject() }
-        resolve(serializedQueue)
-    }
-
-    @objc(getCurrentTrack:rejecter:)
-    public func getCurrentTrack(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        let index = player.currentIndex
-        if index < 0 || index >= player.items.count {
-            resolve(NSNull())
-        } else {
-            resolve(index)
-        }
-    }
-
-    @objc(getDuration:rejecter:)
-    public func getDuration(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.duration)
-    }
-
-    @objc(getBufferedPosition:rejecter:)
-    public func getBufferedPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.bufferedPosition)
-    }
-
-    @objc(getPosition:rejecter:)
-    public func getPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(player.currentTime)
-    }
-
-    @objc(getState:rejecter:)
-    public func getState(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        resolve(State.fromPlayerState(state: player.playerState).rawValue)
-    }
-
-    @objc(updateMetadataForTrack:metadata:resolver:rejecter:)
-    public func updateMetadata(for trackIndex: NSNumber, metadata: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        if (trackIndex.intValue < 0 || trackIndex.intValue >= player.items.count) {
-            reject("index_out_of_bounds", "The track index is out of bounds", nil)
-            return
-        }
-
-        let track = player.items[trackIndex.intValue] as! Track
-        track.updateMetadata(dictionary: metadata)
-
-        if (player.currentIndex == trackIndex.intValue) {
-            Metadata.update(for: player, with: metadata)
-        }
-
-        resolve(NSNull())
-    }
-
-    @objc(clearNowPlayingMetadata:rejecter:)
-    public func clearNowPlayingMetadata(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        player.nowPlayingInfoController.clear()
-        resolve(NSNull())
-    }
-
-    @objc(updateNowPlayingMetadata:resolver:rejecter:)
-    public func updateNowPlayingMetadata(metadata: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        if !hasInitialized {
-            reject("player_not_initialized", "The player is not initialized. Call setupPlayer first.", nil)
-            return
-        }
-
-        Metadata.update(for: player, with: metadata)
-        resolve(NSNull())
-    }
-
-    // MARK: - QueuedAudioPlayer Event Handlers
-
-    func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
-        sendEvent(withName: "playback-state", body: ["state": State.fromPlayerState(state: state).rawValue])
-    }
-
-    func handleAudioPlayerMetadataReceived(metadata: [AVTimedMetadataGroup]) {
-        // SwiftAudioEx was updated to return the array of timed metadata
-        // Until we have support for that in RNTP, we take the first item to keep existing behaviour.
-        let metadata = metadata.first?.items ?? []
-
-        func getMetadataItem(forIdentifier: AVMetadataIdentifier) -> String {
-            return AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: forIdentifier).first?.stringValue ?? ""
-        }
-
-        var source: String {
-            switch metadata.first?.keySpace {
-            case AVMetadataKeySpace.id3:
-                return "id3"
-            case AVMetadataKeySpace.icy:
-                return "icy"
-            case AVMetadataKeySpace.quickTimeMetadata:
-                return "quicktime"
-            case AVMetadataKeySpace.common:
-                return "unknown"
-            default: return "unknown"
+        if #available(iOS 13.0, *) {
+            if (state == PlayState.playing) {
+                center.playbackState = MPNowPlayingPlaybackState.playing
+            } else if (state == PlayState.paused) {
+                center.playbackState = MPNowPlayingPlaybackState.paused;
+            } else if (state == PlayState.stopped) {
+                    center.playbackState = MPNowPlayingPlaybackState.stopped;
             }
         }
 
-        let album = getMetadataItem(forIdentifier: .commonIdentifierAlbumName)
-        var artist = getMetadataItem(forIdentifier: .commonIdentifierArtist)
-        var title = getMetadataItem(forIdentifier: .commonIdentifierTitle)
-        var date = getMetadataItem(forIdentifier: .commonIdentifierCreationDate)
-        var url = "";
-        var genre = "";
-        if (source == "icy") {
-            url = getMetadataItem(forIdentifier: .icyMetadataStreamURL)
-        } else if (source == "id3") {
-            if (date.isEmpty) {
-                date = getMetadataItem(forIdentifier: .id3MetadataDate)
-            }
-            genre = getMetadataItem(forIdentifier: .id3MetadataContentType)
-            url = getMetadataItem(forIdentifier: .id3MetadataOfficialAudioSourceWebpage)
-            if (url.isEmpty) {
-                url = getMetadataItem(forIdentifier: .id3MetadataOfficialAudioFileWebpage)
-            }
-            if (url.isEmpty) {
-                url = getMetadataItem(forIdentifier: .id3MetadataOfficialArtistWebpage)
-            }
-        } else if (source == "quicktime") {
-            genre = getMetadataItem(forIdentifier: .quickTimeMetadataGenre)
-        }
-
-        // Detect ICY metadata and split title into artist & title:
-        // - source should be either "unknown" (pre iOS 14) or "icy" (iOS 14 and above)
-        // - we have a title, but no artist
-        if ((source == "unknown" || source == "icy") && !title.isEmpty && artist.isEmpty) {
-            if let index = title.range(of: " - ")?.lowerBound {
-                artist = String(title.prefix(upTo: index));
-                title = String(title.suffix(from: title.index(index, offsetBy: 3)));
-            }
-        }
-        var data : [String : String?] = [
-            "title": title.isEmpty ? nil : title,
-            "url": url.isEmpty ? nil : url,
-            "artist": artist.isEmpty ? nil : artist,
-            "album": album.isEmpty ? nil : album,
-            "date": date.isEmpty ? nil : date,
-            "genre": genre.isEmpty ? nil : genre
-        ]
-        if (data.values.contains { $0 != nil }) {
-            data["source"] = source
-            sendEvent(withName: "playback-metadata-received", body: data)
-        }
+        resolve(NSNull())
     }
-
-    func handleAudioPlayerFailed(error: Error?) {
-        sendEvent(withName: "playback-error", body: ["error": error?.localizedDescription])
-    }
-
-    func handleAudioPlayerPlaybackEnded(reason: PlaybackEndedReason) {
-        // fire an event for the queue ending
-        if player.nextItems.count == 0 && reason == PlaybackEndedReason.playedUntilEnd {
-            sendEvent(withName: "playback-queue-ended", body: [
-                "track": player.currentIndex,
-                "position": player.currentTime,
-            ])
-        }
-
-        // fire an event for the same track starting again
-        if player.items.count != 0 && player.repeatMode == .track {
-            handleAudioPlayerQueueIndexChange(previousIndex: player.currentIndex, nextIndex: player.currentIndex)
-        }
-    }
-
-    func handleAudioPlayerQueueIndexChange(previousIndex: Int?, nextIndex: Int?) {
-        var dictionary: [String: Any] = [ "position": player.currentTime ]
-
-        if let previousIndex = previousIndex { dictionary["track"] = previousIndex }
-        if let nextIndex = nextIndex { dictionary["nextTrack"] = nextIndex }
-
-        // Load isLiveStream option for track
-        var isTrackLiveStream = false
-        if let nextIndex = nextIndex {
-            let track = player.items[nextIndex]
-            isTrackLiveStream = (track as? Track)?.isLiveStream ?? false
-        }
-
-        if player.automaticallyUpdateNowPlayingInfo {
-            player.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
-        }
-
-        sendEvent(withName: "playback-track-changed", body: dictionary)
-    }
-
-    func handleAudioPlayerSecondElapse(seconds: Double) {
-        // because you cannot prevent the `event.secondElapse` from firing
-        // do not emit an event if `progressUpdateEventInterval` is nil
-        // additionally, there are certain instances in which this event is emitted
-        // _after_ a manipulation to the queu causing no currentItem to exist (see reset)
-        // in which case we shouldn't emit anything or we'll get an exception.
-        if shouldEmitUpdateEventInterval == false || player.currentItem == nil { return }
-
-        sendEvent(
-            withName: "playback-progress-updated",
-            body: [
-                "position": player.currentTime,
-                "duration": player.duration,
-                "buffered": player.bufferedPosition,
-                "track": player.currentIndex,
+    
+    private func updateMetadata(properties: [String: Any], state: PlayState!) {
+        
+        let center = MPNowPlayingInfoCenter.default()
+        
+        if(center.nowPlayingInfo == nil){
+            center.nowPlayingInfo = [
+                MPMediaItemPropertyTitle: "",
+                MPMediaItemPropertyArtist: "",
+                MPMediaItemPropertyAlbumTitle: "",
+                MPMediaItemPropertyPlaybackDuration: 0,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: 0,
             ]
-        )
+        }
+        
+
+        let elapsedTime = properties["elapsedTime"] as? Double
+        
+        var newNowPlaying = center.nowPlayingInfo
+        
+        newNowPlaying![MPMediaItemPropertyTitle] = currentTrack?.title ?? center.nowPlayingInfo![MPMediaItemPropertyTitle]
+        newNowPlaying![MPMediaItemPropertyArtist] = currentTrack?.artist ?? center.nowPlayingInfo![MPMediaItemPropertyArtist]
+        newNowPlaying![MPMediaItemPropertyAlbumTitle] = currentTrack?.album ?? center.nowPlayingInfo![MPMediaItemPropertyAlbumTitle]
+        newNowPlaying![MPMediaItemPropertyPlaybackDuration] = currentTrack?.duration ?? center.nowPlayingInfo![MPMediaItemPropertyPlaybackDuration]
+        newNowPlaying![MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime ?? center.nowPlayingInfo![MPNowPlayingInfoPropertyElapsedPlaybackTime]
+        newNowPlaying![MPNowPlayingInfoPropertyPlaybackRate] = state == PlayState.paused ? 0 : 1.0
+        
+        let newArtworkUrl = properties["artwork"] as? String
+        
+        self.artworkUrl = MediaURL(object: newArtworkUrl)
+        
+        //add placeholder while image is loading
+        if(newArtworkUrl != nil && newArtworkUrl != self.previousArtworkUrl /*&& !(self.artworkUrl?.isLocal ?? false)*/){
+            newNowPlaying![MPMediaItemPropertyArtwork] = placeHolderImageArtwork
+        }
+        
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = newNowPlaying
+        
+        //updateArtworkIfNeeded(artworkUrl: newArtworkUrl, newNowPlaying: newNowPlaying!)
+        
+        
+        if(newArtworkUrl == nil){
+                return
+        }
+            
+        if(self.previousArtworkUrl == newArtworkUrl && newNowPlaying![MPMediaItemPropertyArtwork] != nil){
+                return
+        }
+        
+        if(newArtworkUrl == ""){
+            return
+        }
+        
+        self.previousArtworkUrl = newArtworkUrl
+        
+        self.getArtwork { [weak self] image in
+            if let image = image {
+                
+                // check whether image is loaded
+                if (image.cgImage == nil && image.ciImage == nil) {
+                    return;
+                }
+                
+                if(self?.previousArtworkUrl != newArtworkUrl){
+                    return
+                }
+                
+                    
+                let artwork = self?.mediaItemArtwork(from: image)//MPMediaItemArtwork(from: image)
+
+                if(MPNowPlayingInfoCenter.default().nowPlayingInfo != nil)
+                {
+                    MPNowPlayingInfoCenter.default().nowPlayingInfo![MPMediaItemPropertyArtwork] = artwork
+                }
+            }
+        }
+    }
+    
+    func getArtwork(_ handler: @escaping (UIImage?) -> Void) {
+        if let artworkURL = self.artworkUrl?.value {
+            if(self.artworkUrl?.isLocal ?? false){
+                
+                if(FileManager.default.fileExists(atPath: artworkURL.path)){
+                    let image = UIImage.init(named: artworkURL.path);
+                    handler(image);
+                }
+                
+            } else {
+                URLSession.shared.dataTask(with: artworkURL, completionHandler: { (data, _, error) in
+                    if let data = data, let artwork = UIImage(data: data), error == nil {
+                        handler(artwork)
+                    }
+
+                    handler(nil)
+                }).resume()
+            }
+        }
+        
+        handler(nil)
+    }
+    
+    fileprivate func mediaItemArtwork(from image: UIImage) -> MPMediaItemArtwork {
+            if #available(iOS 10.0, *) {
+                return MPMediaItemArtwork.init(boundsSize: image.size, requestHandler: { (size: CGSize) -> UIImage in
+                    return image
+                })
+            } else {
+                return MPMediaItemArtwork(image: image)
+            }
     }
 }
